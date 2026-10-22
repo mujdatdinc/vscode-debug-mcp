@@ -3,7 +3,7 @@
   "displayName": "Debug MCP Bridge",
   "description": "Let AI agents control the VS Code debugger — exposes breakpoints, stepping, and runtime inspection over a local HTTP bridge for MCP integration",
   "icon": "images/icon.png",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "publisher": "laststance",
   "license": "MIT",
   "engines": {

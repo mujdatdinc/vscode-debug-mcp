@@ -3,10 +3,67 @@ import * as vscode from "vscode";
 /** DAP requests that resume execution, so the target session stops being paused. */
 type ResumeCommand = "continue" | "next" | "stepIn" | "stepOut";
 
+/** Paused state recorded for one session: every thread that stopped, and why. */
+interface PausedState {
+  threadIds: Set<number>;
+  reason?: string;
+  allThreadsStopped?: boolean;
+}
+
+/** Optional session/thread selector, supplied by an HTTP or MCP caller. */
+export interface SessionSelection {
+  sessionId?: string;
+  threadId?: number;
+}
+
+/** Summary of one live debug session. */
+export interface SessionSummary {
+  id: string;
+  name: string;
+  type: string;
+  parentId: string | null;
+  workspaceFolder: string | null;
+  paused: boolean;
+  threadIds: number[];
+}
+
+/** Thrown when a caller names a session id that is not live. */
+export class SessionNotFoundError extends Error {
+  constructor(
+    public readonly sessionId: string,
+    public readonly candidates: string[],
+  ) {
+    super(
+      `No debug session with id "${sessionId}". ` +
+        `Known sessions: ${candidates.length > 0 ? candidates.join(", ") : "(none)"}.`,
+    );
+    this.name = "SessionNotFoundError";
+  }
+}
+
+/** Thrown when several sessions are paused and no explicit sessionId was given. */
+export class AmbiguousSessionsError extends Error {
+  constructor(
+    public readonly candidates: Array<{ id: string; name: string; threadIds: number[] }>,
+  ) {
+    super(
+      `Multiple debug sessions are paused; specify a sessionId. ` +
+        `Candidates: ${candidates.map((c) => c.id).join(", ")}.`,
+    );
+    this.name = "AmbiguousSessionsError";
+  }
+}
+
 /**
  * Wraps the vscode.debug API to provide a clean interface for external control.
  * Tracks debug session state via event listeners and exposes methods for
  * all debugging operations (breakpoints, stepping, variables, etc.).
+ *
+ * Every operation can be pointed at a specific session (and thread) by passing a
+ * {@link SessionSelection}. Without one, the controller keeps its historical
+ * behaviour of preferring the paused/focused session — except that a genuinely
+ * ambiguous pause (several sessions stopped at once) is refused rather than
+ * guessed.
  *
  * @example
  * const controller = new DebugController();
@@ -26,8 +83,22 @@ export class DebugController {
    */
   private sessions = new Map<string, vscode.DebugSession>();
 
-  /** Thread each paused session stopped on. A missing entry means that session is running. */
-  private stoppedThreads = new Map<string, number>();
+  /**
+   * Paused state per session. A missing entry means the session is running.
+   * Holds every stopped thread so a session that pauses several threads is not
+   * collapsed onto a single thread.
+   */
+  private paused = new Map<string, PausedState>();
+
+  /**
+   * Breakpoints installed through the session's DAP, keyed sessionId -> file ->
+   * list. These exist only inside the debug adapter: VS Code does NOT show them
+   * in its Breakpoints view or the editor gutter.
+   */
+  private perSessionBreakpoints = new Map<
+    string,
+    Map<string, Array<{ line: number; condition?: string; hitCondition?: string; logMessage?: string }>>
+  >();
 
   /** Session VS Code currently focuses. In js-debug this is often the thread-less parent. */
   private activeSessionId: string | null = null;
@@ -69,12 +140,35 @@ export class DebugController {
             onDidSendMessage: (msg: {
               type: string;
               event?: string;
-              body?: { threadId?: number };
+              body?: {
+                threadId?: number;
+                reason?: string;
+                allThreadsStopped?: boolean;
+                allThreadsContinued?: boolean;
+              };
             }) => {
               if (msg.type === "event" && msg.event === "stopped") {
-                this.stoppedThreads.set(session.id, msg.body?.threadId ?? 1);
+                // DAP allows `stopped` without a threadId; fall back to thread 1 the
+                // way the pre-multi-session code did, so a paused session always has
+                // at least one thread id and never looks paused with an empty set.
+                const threadId = msg.body?.threadId ?? 1;
+                const existing = this.paused.get(session.id) ?? { threadIds: new Set<number>() };
+                existing.threadIds.add(threadId);
+                existing.reason = msg.body?.reason ?? existing.reason;
+                existing.allThreadsStopped = msg.body?.allThreadsStopped ?? existing.allThreadsStopped;
+                this.paused.set(session.id, existing);
               } else if (msg.type === "event" && msg.event === "continued") {
-                this.stoppedThreads.delete(session.id);
+                const threadId = msg.body?.threadId;
+                const existing = this.paused.get(session.id);
+                if (!existing) return;
+                // Per DAP, an omitted `allThreadsContinued` means all threads were
+                // resumed; only an explicit false narrows this down to one thread.
+                if (msg.body?.allThreadsContinued === false && threadId !== undefined) {
+                  existing.threadIds.delete(threadId);
+                  if (existing.threadIds.size === 0) this.paused.delete(session.id);
+                } else {
+                  this.paused.delete(session.id);
+                }
               }
             },
             onWillStopSession: () => this.forgetSession(session.id),
@@ -105,10 +199,11 @@ export class DebugController {
     }
   }
 
-  /** Drops a session and any paused state recorded for it. */
+  /** Drops a session and any paused/breakpoint state recorded for it. */
   private forgetSession(sessionId: string): void {
     this.sessions.delete(sessionId);
-    this.stoppedThreads.delete(sessionId);
+    this.paused.delete(sessionId);
+    this.perSessionBreakpoints.delete(sessionId);
     if (this.activeSessionId === sessionId) this.activeSessionId = null;
     if (this.latestSessionId === sessionId) this.latestSessionId = null;
   }
@@ -116,20 +211,51 @@ export class DebugController {
   /**
    * Picks the session and thread that DAP requests should target.
    *
-   * A paused session always wins, because `stackTrace`, `scopes`, and `evaluate`
-   * only work on a paused thread. When nothing is paused we fall back to the
-   * focused session, preferring its child so we never hand back a js-debug
-   * parent that has no threads of its own.
+   * With an explicit `sel.sessionId`, the named session is used (an unknown id
+   * raises {@link SessionNotFoundError}); an explicit `threadId` wins, otherwise
+   * the session's first paused thread is used, or `null` when it is running.
+   *
+   * Without a selection the historical heuristic applies — a paused session wins,
+   * otherwise the focused/latest session (preferring its child) — but when more
+   * than one session is paused the choice is genuinely ambiguous and
+   * {@link AmbiguousSessionsError} is raised instead of guessing.
    */
-  private resolveTarget(): {
+  private resolveTarget(sel?: SessionSelection): {
     session: vscode.DebugSession;
     threadId: number | null;
   } | null {
+    if (sel?.sessionId) {
+      const session = this.sessions.get(sel.sessionId);
+      if (!session) {
+        throw new SessionNotFoundError(sel.sessionId, [...this.sessions.keys()]);
+      }
+      if (sel.threadId !== undefined) {
+        return { session, threadId: sel.threadId };
+      }
+      const paused = this.paused.get(sel.sessionId);
+      if (paused && paused.threadIds.size > 0) {
+        return { session, threadId: paused.threadIds.values().next().value ?? null };
+      }
+      return { session, threadId: null };
+    }
+
+    const pausedIds = this.pausedSessionIds();
+    if (pausedIds.length > 1) {
+      throw new AmbiguousSessionsError(
+        pausedIds.map((id) => ({
+          id,
+          name: this.sessions.get(id)?.name ?? id,
+          threadIds: [...(this.paused.get(id)?.threadIds ?? [])],
+        })),
+      );
+    }
+
     const pausedId = this.resolvePausedSessionId();
     if (pausedId != null) {
       const session = this.sessions.get(pausedId);
       if (session) {
-        return { session, threadId: this.stoppedThreads.get(pausedId) ?? null };
+        const paused = this.paused.get(pausedId);
+        return { session, threadId: paused?.threadIds.values().next().value ?? null };
       }
     }
 
@@ -137,12 +263,21 @@ export class DebugController {
     return fallback ? { session: fallback, threadId: null } : null;
   }
 
+  /** Live sessions currently paused, in map order. */
+  private pausedSessionIds(): string[] {
+    const ids: string[] = [];
+    for (const sessionId of this.paused.keys()) {
+      if (this.sessions.has(sessionId)) ids.push(sessionId);
+    }
+    return ids;
+  }
+
   /** Id of the paused session, preferring the one the user focused in the CALL STACK view. */
   private resolvePausedSessionId(): string | null {
-    if (this.activeSessionId != null && this.stoppedThreads.has(this.activeSessionId)) {
+    if (this.activeSessionId != null && this.paused.has(this.activeSessionId)) {
       return this.activeSessionId;
     }
-    for (const sessionId of this.stoppedThreads.keys()) {
+    for (const sessionId of this.paused.keys()) {
       if (this.sessions.has(sessionId)) return sessionId;
     }
     return null;
@@ -186,7 +321,9 @@ export class DebugController {
               levels: 1,
             });
             if (stackResponse.stackFrames && stackResponse.stackFrames.length > 0) {
-              this.stoppedThreads.set(session.id, thread.id);
+              const existing = this.paused.get(session.id) ?? { threadIds: new Set<number>() };
+              existing.threadIds.add(thread.id);
+              this.paused.set(session.id, existing);
               break;
             }
           } catch {
@@ -200,12 +337,30 @@ export class DebugController {
   }
 
   /**
+   * Lists every live debug session so a caller can choose which one to control.
+   */
+  listSessions(): SessionSummary[] {
+    return [...this.sessions.values()].map((session) => {
+      const paused = this.paused.get(session.id);
+      return {
+        id: session.id,
+        name: session.name,
+        type: session.type,
+        parentId: session.parentSession?.id ?? null,
+        workspaceFolder: session.workspaceFolder?.uri.fsPath ?? null,
+        paused: paused !== undefined,
+        threadIds: paused ? [...paused.threadIds] : [],
+      };
+    });
+  }
+
+  /**
    * Returns the current debug state: inactive, running, or stopped (at breakpoint).
    */
-  getState(): { state: string; threadId: number | null; sessionName: string | null } {
-    const target = this.resolveTarget();
+  getState(sel?: SessionSelection): { state: string; threadId: number | null; sessionName: string | null } {
+    const target = this.resolveTarget(sel);
     const state =
-      this.stoppedThreads.size > 0 ? "stopped" : this.sessions.size > 0 ? "running" : "inactive";
+      this.paused.size > 0 ? "stopped" : this.sessions.size > 0 ? "running" : "inactive";
     return {
       state,
       threadId: target?.threadId ?? null,
@@ -216,30 +371,81 @@ export class DebugController {
   /**
    * Sets a breakpoint at the given file path and line number.
    * Optionally accepts a condition expression and hit count.
+   *
+   * Without `options.sessionId` the breakpoint is a normal global VS Code
+   * breakpoint. With one it is installed over that session's DAP instead and
+   * merged with the session's existing breakpoints — note that DAP-installed
+   * breakpoints are NOT visible in the VS Code UI (Breakpoints view or gutter).
    */
   async setBreakpoint(
     filePath: string,
     line: number,
-    options?: { condition?: string; hitCondition?: string; logMessage?: string },
-  ): Promise<{ success: boolean }> {
-    const uri = vscode.Uri.file(filePath);
-    const position = new vscode.Position(line - 1, 0); // VSCode is 0-indexed
-    const location = new vscode.Location(uri, position);
-    const bp = new vscode.SourceBreakpoint(
-      location,
-      true,
-      options?.condition,
-      options?.hitCondition,
-      options?.logMessage,
-    );
-    vscode.debug.addBreakpoints([bp]);
-    return { success: true };
+    options?: { condition?: string; hitCondition?: string; logMessage?: string; sessionId?: string },
+  ): Promise<{ success: boolean; scope: "session" | "global" }> {
+    const { condition, hitCondition, logMessage, sessionId } = options ?? {};
+
+    if (!sessionId) {
+      const uri = vscode.Uri.file(filePath);
+      const position = new vscode.Position(line - 1, 0); // VSCode is 0-indexed
+      const location = new vscode.Location(uri, position);
+      const bp = new vscode.SourceBreakpoint(
+        location,
+        true,
+        condition,
+        hitCondition,
+        logMessage,
+      );
+      vscode.debug.addBreakpoints([bp]);
+      return { success: true, scope: "global" };
+    }
+
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new SessionNotFoundError(sessionId, [...this.sessions.keys()]);
+    }
+
+    const byFile = this.perSessionBreakpoints.get(sessionId) ?? new Map<
+      string,
+      Array<{ line: number; condition?: string; hitCondition?: string; logMessage?: string }>
+    >();
+    const list = byFile.get(filePath) ?? [];
+    list.push({ line, condition, hitCondition, logMessage });
+    byFile.set(filePath, list);
+    this.perSessionBreakpoints.set(sessionId, byFile);
+
+    await this.pushSessionBreakpoints(session, filePath);
+    return { success: true, scope: "session" };
   }
 
   /**
-   * Removes all breakpoints at the given file path and line number.
+   * Removes breakpoints at the given file path and line number.
+   *
+   * With `sessionId` the breakpoint is removed from that session's DAP record
+   * and the updated list is re-sent over DAP; without one the global VS Code
+   * breakpoints are removed.
    */
-  async removeBreakpoint(filePath: string, line: number): Promise<{ removed: number }> {
+  async removeBreakpoint(
+    filePath: string,
+    line: number,
+    sessionId?: string,
+  ): Promise<{ removed: number }> {
+    if (sessionId) {
+      const session = this.sessions.get(sessionId);
+      if (!session) {
+        throw new SessionNotFoundError(sessionId, [...this.sessions.keys()]);
+      }
+      const byFile = this.perSessionBreakpoints.get(sessionId);
+      const list = byFile?.get(filePath) ?? [];
+      const kept = list.filter((bp) => bp.line !== line);
+      const removed = list.length - kept.length;
+      if (byFile) {
+        if (kept.length > 0) byFile.set(filePath, kept);
+        else byFile.delete(filePath);
+      }
+      await this.pushSessionBreakpoints(session, filePath);
+      return { removed };
+    }
+
     const uri = vscode.Uri.file(filePath);
     const toRemove = vscode.debug.breakpoints.filter((bp) => {
       if (bp instanceof vscode.SourceBreakpoint) {
@@ -252,6 +458,23 @@ export class DebugController {
     });
     vscode.debug.removeBreakpoints(toRemove);
     return { removed: toRemove.length };
+  }
+
+  /** Sends the session's full breakpoint list for one file over DAP. */
+  private async pushSessionBreakpoints(
+    session: vscode.DebugSession,
+    filePath: string,
+  ): Promise<void> {
+    const list = this.perSessionBreakpoints.get(session.id)?.get(filePath) ?? [];
+    await session.customRequest("setBreakpoints", {
+      source: { path: filePath },
+      breakpoints: list.map((bp) => ({
+        line: bp.line,
+        ...(bp.condition ? { condition: bp.condition } : {}),
+        ...(bp.hitCondition ? { hitCondition: bp.hitCondition } : {}),
+        ...(bp.logMessage ? { logMessage: bp.logMessage } : {}),
+      })),
+    });
   }
 
   /**
@@ -303,10 +526,10 @@ export class DebugController {
   }
 
   /**
-   * Stops the currently active debug session.
+   * Stops the selected (or active) debug session.
    */
-  async stopDebugging(): Promise<{ success: boolean }> {
-    const target = this.resolveTarget();
+  async stopDebugging(sel?: SessionSelection): Promise<{ success: boolean }> {
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { success: false };
     }
@@ -320,36 +543,36 @@ export class DebugController {
   /**
    * Sends a continue request to resume execution.
    */
-  async continue_(): Promise<{ success: boolean; error?: string }> {
-    return this.resume("continue");
+  async continue_(sel?: SessionSelection): Promise<{ success: boolean; error?: string }> {
+    return this.resume("continue", sel);
   }
 
   /**
    * Steps over the next statement in the current function.
    */
-  async stepOver(): Promise<{ success: boolean; error?: string }> {
-    return this.resume("next");
+  async stepOver(sel?: SessionSelection): Promise<{ success: boolean; error?: string }> {
+    return this.resume("next", sel);
   }
 
   /**
    * Steps into the next function call.
    */
-  async stepInto(): Promise<{ success: boolean; error?: string }> {
-    return this.resume("stepIn");
+  async stepInto(sel?: SessionSelection): Promise<{ success: boolean; error?: string }> {
+    return this.resume("stepIn", sel);
   }
 
   /**
    * Steps out of the current function.
    */
-  async stepOut(): Promise<{ success: boolean; error?: string }> {
-    return this.resume("stepOut");
+  async stepOut(sel?: SessionSelection): Promise<{ success: boolean; error?: string }> {
+    return this.resume("stepOut", sel);
   }
 
   /**
    * Pauses execution at the current point.
    */
-  async pause(): Promise<{ success: boolean; error?: string }> {
-    const target = this.resolveTarget();
+  async pause(sel?: SessionSelection): Promise<{ success: boolean; error?: string }> {
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { success: false, error: "No active debug session" };
     }
@@ -364,7 +587,7 @@ export class DebugController {
   /**
    * Returns the current call stack (list of stack frames) for the stopped thread.
    */
-  async getCallStack(): Promise<{
+  async getCallStack(sel?: SessionSelection): Promise<{
     frames: Array<{
       id: number;
       name: string;
@@ -374,7 +597,7 @@ export class DebugController {
     }>;
     error?: string;
   }> {
-    const target = this.resolveTarget();
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { frames: [], error: "No active debug session" };
     }
@@ -407,11 +630,12 @@ export class DebugController {
   async getVariables(
     frameId?: number,
     scopeName?: string,
+    sel?: SessionSelection,
   ): Promise<{
     variables: Array<{ name: string; value: string; type?: string; variablesReference: number }>;
     error?: string;
   }> {
-    const target = this.resolveTarget();
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { variables: [], error: "No active debug session" };
     }
@@ -470,8 +694,9 @@ export class DebugController {
     expression: string,
     frameId?: number,
     context?: string,
+    sel?: SessionSelection,
   ): Promise<{ result: string; type?: string; variablesReference?: number; error?: string }> {
-    const target = this.resolveTarget();
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { result: "", error: "No active debug session" };
     }
@@ -507,11 +732,12 @@ export class DebugController {
    */
   async expandVariable(
     variablesReference: number,
+    sel?: SessionSelection,
   ): Promise<{
     variables: Array<{ name: string; value: string; type?: string; variablesReference: number }>;
     error?: string;
   }> {
-    const target = this.resolveTarget();
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { variables: [], error: "No active debug session" };
     }
@@ -536,11 +762,11 @@ export class DebugController {
   /**
    * Returns the list of active threads in the debug session.
    */
-  async getThreads(): Promise<{
+  async getThreads(sel?: SessionSelection): Promise<{
     threads: Array<{ id: number; name: string }>;
     error?: string;
   }> {
-    const target = this.resolveTarget();
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { threads: [], error: "No active debug session" };
     }
@@ -553,25 +779,28 @@ export class DebugController {
   }
 
   /** Resumes the paused session and marks it running without waiting for the `continued` event. */
-  private async resume(command: ResumeCommand): Promise<{ success: boolean; error?: string }> {
-    const target = this.resolveTarget();
+  private async resume(
+    command: ResumeCommand,
+    sel?: SessionSelection,
+  ): Promise<{ success: boolean; error?: string }> {
+    const target = this.resolveTarget(sel);
     if (!target) {
       return { success: false, error: "No active debug session" };
     }
     const sessionId = target.session.id;
-    const pausedThread = this.stoppedThreads.get(sessionId);
+    const previousPause = this.paused.get(sessionId);
     // Clear before sending, not after. A step that lands on the next breakpoint
     // can emit `stopped` before this request resolves, and clearing afterwards
     // would erase that fresh pause and leave the state stuck on "running".
-    this.stoppedThreads.delete(sessionId);
+    this.paused.delete(sessionId);
     try {
       await target.session.customRequest(command, { threadId: target.threadId ?? 1 });
       return { success: true };
     } catch (err) {
       // The request never landed, so the session is still paused where it was —
       // unless a newer `stopped` already recorded a more accurate thread.
-      if (pausedThread !== undefined && !this.stoppedThreads.has(sessionId)) {
-        this.stoppedThreads.set(sessionId, pausedThread);
+      if (previousPause !== undefined && !this.paused.has(sessionId)) {
+        this.paused.set(sessionId, previousPause);
       }
       return { success: false, error: String(err) };
     }

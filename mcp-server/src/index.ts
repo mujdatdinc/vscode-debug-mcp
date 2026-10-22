@@ -13,12 +13,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { VSCodeClient } from "./vscode-client.js";
+import { BridgeError, VSCodeClient } from "./vscode-client.js";
 import { describeInstances, registryFilePath, resolveInstance } from "./registry.js";
 
 const server = new McpServer({
   name: "vscode-debugger",
-  version: "0.1.1",
+  version: "0.2.0",
 });
 
 // ─── Bridge resolution ───────────────────────────────────────────────
@@ -72,17 +72,107 @@ async function resolveClient(): Promise<VSCodeClient> {
   return client;
 }
 
+// ─── Tool result helpers ─────────────────────────────────────────────
+
+type ToolResult = { content: Array<{ type: "text"; text: string }> };
+
+/**
+ * Runs a tool body and serializes its result. A structured bridge failure
+ * (`ambiguous_sessions` / `session_not_found`) becomes a human-readable message
+ * that lists the candidates and asks for a `sessionId`; any other error is
+ * rethrown so it keeps the existing SDK error behaviour.
+ */
+async function runTool(fn: () => Promise<unknown>): Promise<ToolResult> {
+  try {
+    const result = await fn();
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    const friendly = describeBridgeError(err);
+    if (friendly) return friendly;
+    throw err;
+  }
+}
+
+/** Maps a structured 409/404 bridge error to a readable tool result, else null. */
+function describeBridgeError(err: unknown): ToolResult | null {
+  if (!(err instanceof BridgeError)) return null;
+  const body = (err.body ?? {}) as { code?: string; candidates?: unknown };
+
+  if (err.status === 409 && body.code === "ambiguous_sessions") {
+    const candidates = (Array.isArray(body.candidates) ? body.candidates : []) as Array<{
+      id: string;
+      name: string;
+      threadIds: number[];
+    }>;
+    const lines = candidates.map(
+      (c) => `- ${c.id}  (name: ${c.name}, paused threads: ${c.threadIds.join(", ") || "none"})`,
+    );
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            "Multiple debug sessions are paused, so the target is ambiguous.\n" +
+            "Pass one of these as sessionId (see get_sessions):\n" +
+            lines.join("\n"),
+        },
+      ],
+    };
+  }
+
+  if (err.status === 404 && body.code === "session_not_found") {
+    const candidates = (Array.isArray(body.candidates) ? body.candidates : []) as string[];
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            "No debug session with that sessionId. Known session ids: " +
+            `${candidates.length > 0 ? candidates.join(", ") : "(none)"}. ` +
+            "Pick one (see get_sessions) and pass it as sessionId.",
+        },
+      ],
+    };
+  }
+
+  return null;
+}
+
+/** Reusable optional selector params for the session-scoped tools. */
+const sessionIdParam = z
+  .string()
+  .optional()
+  .describe("Debug session id to control (from get_sessions). Omit to use the active/only paused session.");
+const threadIdParam = z
+  .number()
+  .int()
+  .optional()
+  .describe("Thread id within the chosen session (from get_sessions). Omit to use the session's first paused thread.");
+
 // ─── Tools ───────────────────────────────────────────────────────────
+
+server.tool(
+  "get_sessions",
+  "List every live debug session (id, name, type, parentId, paused, threadIds). Use it to pick the session to control, then pass its id to the other tools.",
+  {},
+  async () =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.get("/sessions");
+    }),
+);
 
 server.tool(
   "get_debug_state",
   "Get the current debug state (inactive, running, or stopped at breakpoint)",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const state = await client.get("/state");
-    return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.get("/state", { sessionId });
+    }),
 );
 
 server.tool(
@@ -94,12 +184,13 @@ server.tool(
     condition: z.string().optional().describe("Conditional expression — breakpoint only hits when this evaluates to true"),
     hitCondition: z.string().optional().describe("Hit count expression — breakpoint hits after this many passes"),
     logMessage: z.string().optional().describe("Log message instead of breaking (logpoint). Use {expression} for interpolation."),
+    sessionId: sessionIdParam,
   },
-  async ({ file, line, condition, hitCondition, logMessage }) => {
-    const client = await resolveClient();
-    const result = await client.post("/breakpoint", { file, line, condition, hitCondition, logMessage });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+  async ({ file, line, condition, hitCondition, logMessage, sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/breakpoint", { file, line, condition, hitCondition, logMessage, sessionId });
+    }),
 );
 
 server.tool(
@@ -108,23 +199,24 @@ server.tool(
   {
     file: z.string().describe("Absolute path to the source file"),
     line: z.number().int().positive().describe("Line number (1-indexed)"),
+    sessionId: sessionIdParam,
   },
-  async ({ file, line }) => {
-    const client = await resolveClient();
-    const result = await client.delete("/breakpoint", { file, line });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+  async ({ file, line, sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.delete("/breakpoint", { file, line, sessionId });
+    }),
 );
 
 server.tool(
   "list_breakpoints",
   "List all currently set breakpoints with their file paths, line numbers, and conditions",
   {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.get("/breakpoints");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+  async () =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.get("/breakpoints");
+    }),
 );
 
 server.tool(
@@ -146,91 +238,106 @@ server.tool(
       stopOnEntry: z.boolean().optional().describe("Stop at the first line of the program"),
     }).optional().describe("Inline debug configuration"),
   },
-  async ({ configName, config }) => {
-    const client = await resolveClient();
-    const body: Record<string, unknown> = {};
-    if (configName) body.configName = configName;
-    if (config) body.config = config;
-    const result = await client.post("/debug/launch", body);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+  async ({ configName, config }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      const body: Record<string, unknown> = {};
+      if (configName) body.configName = configName;
+      if (config) body.config = config;
+      return client.post("/debug/launch", body);
+    }),
 );
 
 server.tool(
   "stop_debugging",
-  "Stop the currently active debug session",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/stop");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  "Stop the currently active (or selected) debug session",
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/stop", { sessionId });
+    }),
 );
 
 server.tool(
   "debug_continue",
   "Continue execution (resume from a breakpoint or pause)",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/continue");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/continue", { sessionId });
+    }),
 );
 
 server.tool(
   "debug_step_over",
   "Step over the next statement (execute without entering function calls)",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/stepOver");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/stepOver", { sessionId });
+    }),
 );
 
 server.tool(
   "debug_step_into",
   "Step into the next function call",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/stepInto");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/stepInto", { sessionId });
+    }),
 );
 
 server.tool(
   "debug_step_out",
   "Step out of the current function (return to caller)",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/stepOut");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/stepOut", { sessionId });
+    }),
 );
 
 server.tool(
   "debug_pause",
   "Pause execution of the running program",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/pause");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/pause", { sessionId });
+    }),
 );
 
 server.tool(
   "get_call_stack",
   "Get the current call stack (list of stack frames with file paths and line numbers)",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.get("/debug/callstack");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
+    threadId: threadIdParam,
   },
+  async ({ sessionId, threadId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.get("/debug/callstack", { sessionId, threadId });
+    }),
 );
 
 server.tool(
@@ -239,12 +346,14 @@ server.tool(
   {
     frameId: z.number().int().optional().describe("Stack frame ID (from get_call_stack). Defaults to the top frame."),
     scope: z.string().optional().describe("Scope name filter (e.g., 'Local', 'Global', 'Closure'). Shows all scopes if omitted."),
+    sessionId: sessionIdParam,
+    threadId: threadIdParam,
   },
-  async ({ frameId, scope }) => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/variables", { frameId, scope });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+  async ({ frameId, scope, sessionId, threadId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/variables", { frameId, scope, sessionId, threadId });
+    }),
 );
 
 server.tool(
@@ -254,12 +363,14 @@ server.tool(
     expression: z.string().describe("Expression to evaluate (e.g., 'myVar.length', 'arr.filter(x => x > 0)')"),
     frameId: z.number().int().optional().describe("Stack frame ID to evaluate in. Defaults to the top frame."),
     context: z.enum(["watch", "repl", "hover"]).optional().describe("Evaluation context. 'repl' allows side effects, 'watch' is read-only, 'hover' is for tooltips."),
+    sessionId: sessionIdParam,
+    threadId: threadIdParam,
   },
-  async ({ expression, frameId, context }) => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/evaluate", { expression, frameId, context });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+  async ({ expression, frameId, context, sessionId, threadId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/evaluate", { expression, frameId, context, sessionId, threadId });
+    }),
 );
 
 server.tool(
@@ -267,23 +378,26 @@ server.tool(
   "Expand a complex variable (object, array) to see its child properties. Use the variablesReference from get_variables or evaluate_expression.",
   {
     variablesReference: z.number().int().describe("The variablesReference ID of the variable to expand (from get_variables or evaluate_expression results)"),
+    sessionId: sessionIdParam,
   },
-  async ({ variablesReference }) => {
-    const client = await resolveClient();
-    const result = await client.post("/debug/expand", { variablesReference });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+  async ({ variablesReference, sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.post("/debug/expand", { variablesReference, sessionId });
+    }),
 );
 
 server.tool(
   "get_threads",
   "List all threads in the current debug session",
-  {},
-  async () => {
-    const client = await resolveClient();
-    const result = await client.get("/debug/threads");
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  {
+    sessionId: sessionIdParam,
   },
+  async ({ sessionId }) =>
+    runTool(async () => {
+      const client = await resolveClient();
+      return client.get("/debug/threads", { sessionId });
+    }),
 );
 
 // ─── Start ───────────────────────────────────────────────────────────

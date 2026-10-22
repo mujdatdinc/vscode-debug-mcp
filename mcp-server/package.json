@@ -1,6 +1,6 @@
 {
   "name": "vscode-debug-mcp",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "MCP server that lets AI agents control the VS Code debugger — breakpoints, stepping, call stacks, variables, and expression evaluation",
   "type": "module",
   "main": "dist/index.js",

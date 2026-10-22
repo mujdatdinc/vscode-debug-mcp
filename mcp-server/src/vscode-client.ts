@@ -7,6 +7,24 @@
  * const state = await client.get("/state");
  * await client.post("/breakpoint", { file: "app.ts", line: 10 });
  */
+
+/**
+ * Error raised for a non-2xx bridge response. Carries the HTTP `status` and the
+ * parsed response `body` alongside the historical message text, so callers can
+ * react to structured error codes (e.g. `session_not_found`,
+ * `ambiguous_sessions`) without breaking existing `Error` handling.
+ */
+export class BridgeError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly body: unknown,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BridgeError";
+  }
+}
+
 export class VSCodeClient {
   private baseUrl: string;
 
@@ -25,18 +43,46 @@ export class VSCodeClient {
     };
   }
 
+  /** Parses a failed response into a {@link BridgeError}, keeping the legacy message. */
+  private async bridgeError(response: Response): Promise<BridgeError> {
+    const text = await response.text();
+    let body: unknown = text;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // Not JSON — keep the raw text as the body.
+    }
+    return new BridgeError(
+      response.status,
+      body,
+      `Bridge request failed (${response.status}): ${text}`,
+    );
+  }
+
   /**
    * Sends a GET request to the extension bridge server.
+   * Optional `query` values are appended as query parameters.
    */
-  async get<T = unknown>(path: string): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
+  async get<T = unknown>(
+    path: string,
+    query?: Record<string, string | number | undefined>,
+  ): Promise<T> {
+    const url = new URL(`${this.baseUrl}${path}`);
+    if (query) {
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined && value !== null && value !== "") {
+          url.searchParams.set(key, String(value));
+        }
+      }
+    }
+
+    const response = await fetch(url.toString(), {
       method: "GET",
       headers: this.headers(),
     });
 
     if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Bridge request failed (${response.status}): ${body}`);
+      throw await this.bridgeError(response);
     }
 
     return response.json() as Promise<T>;
@@ -53,8 +99,7 @@ export class VSCodeClient {
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Bridge request failed (${response.status}): ${text}`);
+      throw await this.bridgeError(response);
     }
 
     return response.json() as Promise<T>;
@@ -71,8 +116,7 @@ export class VSCodeClient {
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Bridge request failed (${response.status}): ${text}`);
+      throw await this.bridgeError(response);
     }
 
     return response.json() as Promise<T>;

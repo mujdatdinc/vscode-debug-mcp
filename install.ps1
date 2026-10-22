@@ -14,7 +14,7 @@
     path differs per machine, so it is not patched automatically).
 
 .PARAMETER Tag
-    Release tag to install from. Default: v0.1.4
+    Release tag to install from. Default: v0.2.0
 
 .PARAMETER Repo
     GitHub repository holding the release. Default: mujdatdinc/vscode-debug-mcp
@@ -24,7 +24,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Tag = "v0.1.4",
+    [string]$Tag = "v0.2.0",
     [string]$Repo = "mujdatdinc/vscode-debug-mcp",
     [switch]$SkipExtension,
     [switch]$SkipServer
@@ -32,8 +32,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$vsixName = "vscode-debug-mcp-bridge-0.1.4.vsix"
-$tgzName = "vscode-debug-mcp-0.1.1.tgz"
+$vsixName = "vscode-debug-mcp-bridge-0.2.0.vsix"
+$tgzName = "vscode-debug-mcp-0.2.0.tgz"
 $base = "https://github.com/$Repo/releases/download/$Tag"
 $work = Join-Path $env:TEMP "vscode-debug-mcp-install"
 
