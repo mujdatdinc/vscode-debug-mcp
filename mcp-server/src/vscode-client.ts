@@ -3,15 +3,26 @@
  * Sends requests to the extension's HTTP server running on localhost.
  *
  * @example
- * const client = new VSCodeClient(7779);
+ * const client = new VSCodeClient(7779, token);
  * const state = await client.get("/state");
  * await client.post("/breakpoint", { file: "app.ts", line: 10 });
  */
 export class VSCodeClient {
   private baseUrl: string;
 
-  constructor(port: number = 7779) {
+  constructor(
+    port: number = 7779,
+    private readonly token?: string,
+  ) {
     this.baseUrl = `http://127.0.0.1:${port}`;
+  }
+
+  /** Request headers, including the per-window bridge token when known. */
+  private headers(): Record<string, string> {
+    return {
+      "Content-Type": "application/json",
+      ...(this.token ? { "x-bridge-token": this.token } : {}),
+    };
   }
 
   /**
@@ -20,7 +31,7 @@ export class VSCodeClient {
   async get<T = unknown>(path: string): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "GET",
-      headers: { "Content-Type": "application/json" },
+      headers: this.headers(),
     });
 
     if (!response.ok) {
@@ -37,7 +48,7 @@ export class VSCodeClient {
   async post<T = unknown>(path: string, body: Record<string, unknown> = {}): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: this.headers(),
       body: JSON.stringify(body),
     });
 
@@ -55,7 +66,7 @@ export class VSCodeClient {
   async delete<T = unknown>(path: string, body: Record<string, unknown> = {}): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "DELETE",
-      headers: { "Content-Type": "application/json" },
+      headers: this.headers(),
       body: JSON.stringify(body),
     });
 

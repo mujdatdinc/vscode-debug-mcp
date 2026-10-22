@@ -3,7 +3,7 @@
   "displayName": "Debug MCP Bridge",
   "description": "Let AI agents control the VS Code debugger — exposes breakpoints, stepping, and runtime inspection over a local HTTP bridge for MCP integration",
   "icon": "images/icon.png",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "laststance",
   "license": "MIT",
   "engines": {
@@ -49,7 +49,12 @@
         "debugMcpBridge.port": {
           "type": "number",
           "default": 7779,
-          "description": "Port for the HTTP bridge server"
+          "description": "Preferred port for the HTTP bridge server"
+        },
+        "debugMcpBridge.allowPortFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "If the preferred port is in use, listen on an ephemeral port instead of failing. Lets several VS Code windows run their own bridge."
         }
       }
     }

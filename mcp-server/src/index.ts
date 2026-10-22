@@ -14,26 +14,62 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { VSCodeClient } from "./vscode-client.js";
-
-const port = parseInt(process.env.VSCODE_DEBUG_PORT ?? "7779", 10);
-const client = new VSCodeClient(port);
+import { describeInstances, registryFilePath, resolveInstance } from "./registry.js";
 
 const server = new McpServer({
   name: "vscode-debugger",
-  version: "0.1.0",
+  version: "0.1.1",
 });
 
-// ─── Connection check helper ─────────────────────────────────────────
+// ─── Bridge resolution ───────────────────────────────────────────────
 
-async function ensureConnected(): Promise<void> {
-  const connected = await client.isConnected();
-  if (!connected) {
+let connected: VSCodeClient | null = null;
+
+function parsePort(value: string | undefined): number | null {
+  const parsed = value ? Number.parseInt(value, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * Resolves the bridge of the VS Code window this server was launched from.
+ * Re-resolves whenever the cached client stops answering, so a bridge that
+ * starts or restarts later is picked up without restarting this server.
+ */
+async function resolveClient(): Promise<VSCodeClient> {
+  if (connected && (await connected.isConnected())) return connected;
+
+  const forcedPort = parsePort(process.env.VSCODE_DEBUG_BRIDGE_PORT);
+  if (forcedPort) {
+    const forced = new VSCodeClient(forcedPort, process.env.VSCODE_DEBUG_BRIDGE_TOKEN?.trim());
+    if (!(await forced.isConnected())) {
+      throw new Error(`No Debug MCP Bridge answering on fixed port ${forcedPort}.`);
+    }
+    connected = forced;
+    return forced;
+  }
+
+  const instance = resolveInstance();
+  if (!instance) {
     throw new Error(
-      "VSCode Debug MCP Bridge extension is not running. " +
-      "Please open VSCode and ensure the 'Debug MCP Bridge' extension is installed and activated. " +
-      "You can manually start it via Command Palette: 'Debug MCP Bridge: Start Server'.",
+      "Cannot determine which VS Code window this server belongs to.\n" +
+        "Registered bridges:\n" +
+        describeInstances() +
+        "\nSet VSCODE_DEBUG_REGISTRY_ENTRY to one of the ids above, " +
+        "or VSCODE_DEBUG_BRIDGE_PORT to force a port.",
     );
   }
+
+  const client = new VSCodeClient(instance.port, instance.token);
+  if (!(await client.isConnected())) {
+    throw new Error(
+      `Bridge ${instance.id} is registered on port ${instance.port} but is not answering. ` +
+        "Start it from the Command Palette: 'Debug MCP Bridge: Start Server'.",
+    );
+  }
+
+  console.error(`vscode-debug-mcp: using bridge ${instance.id} on port ${instance.port}`);
+  connected = client;
+  return client;
 }
 
 // ─── Tools ───────────────────────────────────────────────────────────
@@ -43,7 +79,7 @@ server.tool(
   "Get the current debug state (inactive, running, or stopped at breakpoint)",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const state = await client.get("/state");
     return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
   },
@@ -60,7 +96,7 @@ server.tool(
     logMessage: z.string().optional().describe("Log message instead of breaking (logpoint). Use {expression} for interpolation."),
   },
   async ({ file, line, condition, hitCondition, logMessage }) => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/breakpoint", { file, line, condition, hitCondition, logMessage });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -74,7 +110,7 @@ server.tool(
     line: z.number().int().positive().describe("Line number (1-indexed)"),
   },
   async ({ file, line }) => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.delete("/breakpoint", { file, line });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -85,7 +121,7 @@ server.tool(
   "List all currently set breakpoints with their file paths, line numbers, and conditions",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.get("/breakpoints");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -111,7 +147,7 @@ server.tool(
     }).optional().describe("Inline debug configuration"),
   },
   async ({ configName, config }) => {
-    await ensureConnected();
+    const client = await resolveClient();
     const body: Record<string, unknown> = {};
     if (configName) body.configName = configName;
     if (config) body.config = config;
@@ -125,7 +161,7 @@ server.tool(
   "Stop the currently active debug session",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/stop");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -136,7 +172,7 @@ server.tool(
   "Continue execution (resume from a breakpoint or pause)",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/continue");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -147,7 +183,7 @@ server.tool(
   "Step over the next statement (execute without entering function calls)",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/stepOver");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -158,7 +194,7 @@ server.tool(
   "Step into the next function call",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/stepInto");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -169,7 +205,7 @@ server.tool(
   "Step out of the current function (return to caller)",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/stepOut");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -180,7 +216,7 @@ server.tool(
   "Pause execution of the running program",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/pause");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -191,7 +227,7 @@ server.tool(
   "Get the current call stack (list of stack frames with file paths and line numbers)",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.get("/debug/callstack");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -205,7 +241,7 @@ server.tool(
     scope: z.string().optional().describe("Scope name filter (e.g., 'Local', 'Global', 'Closure'). Shows all scopes if omitted."),
   },
   async ({ frameId, scope }) => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/variables", { frameId, scope });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -220,7 +256,7 @@ server.tool(
     context: z.enum(["watch", "repl", "hover"]).optional().describe("Evaluation context. 'repl' allows side effects, 'watch' is read-only, 'hover' is for tooltips."),
   },
   async ({ expression, frameId, context }) => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/evaluate", { expression, frameId, context });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -233,7 +269,7 @@ server.tool(
     variablesReference: z.number().int().describe("The variablesReference ID of the variable to expand (from get_variables or evaluate_expression results)"),
   },
   async ({ variablesReference }) => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.post("/debug/expand", { variablesReference });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -244,7 +280,7 @@ server.tool(
   "List all threads in the current debug session",
   {},
   async () => {
-    await ensureConnected();
+    const client = await resolveClient();
     const result = await client.get("/debug/threads");
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -255,7 +291,7 @@ server.tool(
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`VSCode Debug MCP Server running on stdio (bridge port: ${port})`);
+  console.error(`VSCode Debug MCP Server running on stdio (registry: ${registryFilePath()})`);
 }
 
 main().catch((error) => {

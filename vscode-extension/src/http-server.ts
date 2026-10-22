@@ -1,4 +1,5 @@
 import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import { DebugController } from "./debug-controller";
 
 // Read from the manifest so /health can be used to confirm which build is live
@@ -18,11 +19,21 @@ const { version: EXTENSION_VERSION } = require("../package.json") as { version: 
  */
 export class BridgeServer {
   private server: http.Server | null = null;
+  private actualPort: number | null = null;
 
   constructor(
     private controller: DebugController,
     private port: number,
+    private readonly token?: string,
   ) {}
+
+  /**
+   * The port actually bound. Differs from the requested port when `0`
+   * (ephemeral) was requested because the configured port was already taken.
+   */
+  get boundPort(): number {
+    return this.actualPort ?? this.port;
+  }
 
   /**
    * Starts the HTTP server on localhost.
@@ -33,9 +44,20 @@ export class BridgeServer {
       this.server = http.createServer(async (req, res) => {
         res.setHeader("Content-Type", "application/json");
 
+        const url = req.url ?? "";
+
+        // When a token is configured, every route except /health requires it.
+        // The bridge can change program state, so knowing the port must not be
+        // enough for any other local process to drive the debugger.
+        if (this.token && url !== "/health" && req.headers["x-bridge-token"] !== this.token) {
+          res.writeHead(401);
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+
         try {
           const body = await readBody(req);
-          const result = await this.route(req.method ?? "", req.url ?? "", body);
+          const result = await this.route(req.method ?? "", url, body);
           res.writeHead(200);
           res.end(JSON.stringify(result));
         } catch (err) {
@@ -47,6 +69,7 @@ export class BridgeServer {
 
       this.server.on("error", reject);
       this.server.listen(this.port, "127.0.0.1", () => {
+        this.actualPort = (this.server?.address() as AddressInfo).port;
         resolve();
       });
     });
@@ -61,7 +84,11 @@ export class BridgeServer {
         resolve();
         return;
       }
-      this.server.close(() => resolve());
+      this.server.close(() => {
+        this.server = null;
+        this.actualPort = null;
+        resolve();
+      });
     });
   }
 
